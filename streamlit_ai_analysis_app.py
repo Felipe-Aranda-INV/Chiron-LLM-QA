@@ -10,6 +10,30 @@ from plotly.subplots import make_subplots
 import re
 from typing import Dict, List, Optional, Tuple
 import uuid
+import traceback
+import sys
+
+# Optional imports with error handling
+try:
+    import fitz  # PyMuPDF
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    st.error("PyMuPDF not installed. PDF processing will be limited.")
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    st.warning("OCR libraries not available. Image-based PDF processing will be limited.")
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
 # Configure page
 st.set_page_config(
@@ -66,6 +90,12 @@ st.markdown("""
     .error { background-color: #ffebee; border-left: 4px solid #f44336; }
     .warning { background-color: #fff3e0; border-left: 4px solid #ff9800; }
     .info { background-color: #e3f2fd; border-left: 4px solid #2196f3; }
+    .file-info {
+        background-color: #f5f5f5;
+        padding: 0.5rem;
+        border-radius: 4px;
+        margin: 0.5rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,8 +118,61 @@ class AIModelAnalyzer:
             ('Bard 2.5 Flash', 'cGPT 4o')
         ]
 
+    def validate_file(self, file) -> Tuple[bool, str]:
+        """Validate uploaded file"""
+        if file is None:
+            return False, "No file provided"
+        
+        # Check file size (max 10MB)
+        if file.size > 10 * 1024 * 1024:
+            return False, "File too large (max 10MB)"
+        
+        # Check file type
+        if file.type not in ['application/pdf', 'text/plain']:
+            return False, "Only PDF and TXT files are supported"
+        
+        return True, "File is valid"
+
+    def extract_text_from_pdf(self, file_bytes: bytes) -> str:
+        """Extract text from PDF file"""
+        if not PDF_AVAILABLE:
+            raise Exception("PyMuPDF not available. Cannot process PDF files.")
+        
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            text_content = ""
+            
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text()
+                
+                if text.strip():
+                    text_content += f"\n--- PAGE {page_num + 1} ---\n"
+                    text_content += text
+                else:
+                    # Try OCR if page has no text
+                    if OCR_AVAILABLE:
+                        pix = page.get_pixmap()
+                        img_data = pix.tobytes("png")
+                        image = Image.open(io.BytesIO(img_data))
+                        ocr_text = pytesseract.image_to_string(image)
+                        if ocr_text.strip():
+                            text_content += f"\n--- PAGE {page_num + 1} (OCR) ---\n"
+                            text_content += ocr_text
+                    else:
+                        text_content += f"\n--- PAGE {page_num + 1} (NO TEXT) ---\n"
+            
+            doc.close()
+            return text_content
+            
+        except Exception as e:
+            raise Exception(f"Error extracting text from PDF: {str(e)}")
+
     def detect_ai_model(self, text: str) -> str:
         """Detect AI model from text using pattern matching"""
+        if not text:
+            return 'Unknown'
+            
         text_lower = text.lower()
         
         for model, config in self.supported_models.items():
@@ -118,91 +201,106 @@ class AIModelAnalyzer:
         
         return 'Unknown'
 
-    def extract_conversation_from_text(self, text: str, page_num: int) -> Dict:
+    def extract_conversation_from_text(self, text: str, page_num: int) -> List[Dict]:
         """Extract conversation data from raw text"""
-        lines = text.split('\n')
-        conversation_data = {
-            'conversation_id': str(uuid.uuid4()),
-            'page': page_num,
-            'ai_model': 'Unknown',
-            'user_prompt': '',
-            'ai_response': '',
-            'response_type': 'unknown',
-            'conversation_context': '',
-            'timestamp': datetime.now().isoformat(),
-            'metadata': {
-                'model_version': '',
-                'response_length': 0,
-                'has_code': False,
-                'has_math': False,
-                'processing_quality': 'good'
-            }
-        }
+        conversations = []
         
-        # Detect AI model
-        conversation_data['ai_model'] = self.detect_ai_model(text)
+        if not text.strip():
+            return conversations
         
-        # Extract user prompt and AI response
-        user_prompt = ''
-        ai_response = ''
-        context = ''
+        # Split by potential conversation boundaries
+        sections = re.split(r'\n\s*\n', text)
         
-        # Pattern matching for different conversation formats
-        current_section = 'unknown'
-        temp_text = ''
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
+        for section in sections:
+            if len(section.strip()) < 10:  # Skip very short sections
                 continue
                 
-            # Check for user indicators
-            if re.search(r'^(user|you|human|question):', line, re.IGNORECASE):
-                current_section = 'user'
-                temp_text = line.split(':', 1)[1].strip() if ':' in line else line
-            elif re.search(r'^(assistant|ai|bot|' + conversation_data['ai_model'].lower() + '):', line, re.IGNORECASE):
-                if current_section == 'user' and temp_text:
-                    user_prompt = temp_text
-                current_section = 'ai'
-                temp_text = line.split(':', 1)[1].strip() if ':' in line else line
-            elif current_section == 'user':
-                temp_text += ' ' + line
-            elif current_section == 'ai':
-                temp_text += ' ' + line
-            else:
-                # Try to detect implicit conversation structure
-                if len(line) > 10 and '?' in line:
-                    if not user_prompt:
-                        user_prompt = line
-                        current_section = 'user'
-                elif len(line) > 20 and current_section == 'user':
-                    ai_response = line
+            conversation_data = {
+                'conversation_id': str(uuid.uuid4()),
+                'page': page_num,
+                'ai_model': 'Unknown',
+                'user_prompt': '',
+                'ai_response': '',
+                'response_type': 'unknown',
+                'conversation_context': '',
+                'timestamp': datetime.now().isoformat(),
+                'metadata': {
+                    'model_version': '',
+                    'response_length': 0,
+                    'has_code': False,
+                    'has_math': False,
+                    'processing_quality': 'good'
+                }
+            }
+            
+            # Detect AI model
+            conversation_data['ai_model'] = self.detect_ai_model(section)
+            
+            # Extract user prompt and AI response
+            lines = section.split('\n')
+            user_prompt = ''
+            ai_response = ''
+            current_section = 'unknown'
+            temp_text = ''
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Check for user indicators
+                if re.search(r'^(user|you|human|question):', line, re.IGNORECASE):
+                    if current_section == 'ai' and temp_text:
+                        ai_response = temp_text
+                    current_section = 'user'
+                    temp_text = line.split(':', 1)[1].strip() if ':' in line else line
+                elif re.search(r'^(assistant|ai|bot|bard|chatgpt|claude|ais):', line, re.IGNORECASE):
+                    if current_section == 'user' and temp_text:
+                        user_prompt = temp_text
                     current_section = 'ai'
-                    temp_text = line
+                    temp_text = line.split(':', 1)[1].strip() if ':' in line else line
+                elif current_section == 'user':
+                    temp_text += ' ' + line
+                elif current_section == 'ai':
+                    temp_text += ' ' + line
+                else:
+                    # Try to detect implicit conversation structure
+                    if '?' in line and len(line) > 10:
+                        if not user_prompt:
+                            user_prompt = line
+                            current_section = 'user'
+                    elif len(line) > 20 and current_section == 'user':
+                        ai_response = line
+                        current_section = 'ai'
+                        temp_text = line
+            
+            # Finalize extraction
+            if current_section == 'ai' and temp_text:
+                ai_response = temp_text
+            elif current_section == 'user' and temp_text:
+                user_prompt = temp_text
+            
+            # Only add if we have meaningful content
+            if user_prompt.strip() or ai_response.strip():
+                conversation_data['user_prompt'] = user_prompt.strip()
+                conversation_data['ai_response'] = ai_response.strip()
+                
+                # Classify response type
+                conversation_data['response_type'] = self.classify_response_type(ai_response)
+                
+                # Extract metadata
+                conversation_data['metadata']['response_length'] = len(ai_response)
+                conversation_data['metadata']['has_code'] = bool(re.search(r'```|`[^`]+`|def |class |import |function', ai_response))
+                conversation_data['metadata']['has_math'] = bool(re.search(r'\d+\.\d+|\+|\-|\*|\/|=|\^|\$.*\$', ai_response))
+                
+                # Extract model version if available
+                version_match = re.search(r'(2\.5|4o|o3|pro|flash)', section.lower())
+                if version_match:
+                    conversation_data['metadata']['model_version'] = version_match.group(1)
+                
+                conversations.append(conversation_data)
         
-        # Finalize extraction
-        if current_section == 'ai' and temp_text:
-            ai_response = temp_text
-        elif current_section == 'user' and temp_text:
-            user_prompt = temp_text
-        
-        conversation_data['user_prompt'] = user_prompt.strip()
-        conversation_data['ai_response'] = ai_response.strip()
-        
-        # Classify response type
-        conversation_data['response_type'] = self.classify_response_type(ai_response)
-        
-        # Extract metadata
-        conversation_data['metadata']['response_length'] = len(ai_response)
-        conversation_data['metadata']['has_code'] = bool(re.search(r'```|`[^`]+`|def |class |import |function', ai_response))
-        conversation_data['metadata']['has_math'] = bool(re.search(r'\d+\.\d+|\+|\-|\*|\/|=|\^|\$.*\$', ai_response))
-        
-        # Extract model version if available
-        version_match = re.search(r'(2\.5|4o|o3|pro|flash)', text.lower())
-        if version_match:
-            conversation_data['metadata']['model_version'] = version_match.group(1)
-        
-        return conversation_data
+        return conversations
 
     def classify_response_type(self, response: str) -> str:
         """Classify the type of AI response"""
@@ -224,26 +322,76 @@ class AIModelAnalyzer:
         else:
             return 'informative'
 
-    def process_pdf_text(self, text_content: str) -> List[Dict]:
-        """Process extracted PDF text and return structured conversation data"""
-        # Split text into pages (assuming page breaks are marked)
-        pages = text_content.split('\n--- PAGE BREAK ---\n')
-        
+    def process_file_content(self, file, progress_callback=None) -> List[Dict]:
+        """Process file content and return structured conversation data"""
         conversations = []
-        for i, page_text in enumerate(pages, 1):
-            if page_text.strip():
-                conversation = self.extract_conversation_from_text(page_text, i)
-                if conversation['user_prompt'] or conversation['ai_response']:
-                    conversations.append(conversation)
         
-        return conversations
+        try:
+            # Validate file
+            is_valid, message = self.validate_file(file)
+            if not is_valid:
+                raise Exception(message)
+            
+            if progress_callback:
+                progress_callback(10, f"Reading {file.name}...")
+            
+            # Extract text based on file type
+            if file.type == 'application/pdf':
+                file_bytes = file.read()
+                text_content = self.extract_text_from_pdf(file_bytes)
+            else:  # text/plain
+                text_content = str(file.read(), "utf-8")
+            
+            if progress_callback:
+                progress_callback(50, f"Processing text from {file.name}...")
+            
+            # Split text into pages
+            pages = re.split(r'\n--- PAGE \d+ ---\n', text_content)
+            
+            for i, page_text in enumerate(pages, 1):
+                if page_text.strip():
+                    if progress_callback:
+                        progress_callback(50 + (i / len(pages)) * 40, f"Processing page {i} of {len(pages)}...")
+                    
+                    page_conversations = self.extract_conversation_from_text(page_text, i)
+                    conversations.extend(page_conversations)
+            
+            if progress_callback:
+                progress_callback(100, f"Completed processing {file.name}")
+            
+            return conversations
+            
+        except Exception as e:
+            raise Exception(f"Error processing {file.name}: {str(e)}")
 
 # Initialize the analyzer
 @st.cache_resource
 def get_analyzer():
     return AIModelAnalyzer()
 
+def display_file_info(file):
+    """Display file information"""
+    file_size = file.size / 1024  # Convert to KB
+    size_unit = "KB"
+    if file_size > 1024:
+        file_size /= 1024
+        size_unit = "MB"
+    
+    st.markdown(f"""
+    <div class="file-info">
+        <strong>📄 {file.name}</strong><br>
+        Size: {file_size:.1f} {size_unit}<br>
+        Type: {file.type}
+    </div>
+    """, unsafe_allow_html=True)
+
 def main():
+    # Initialize session state
+    if 'processed_data' not in st.session_state:
+        st.session_state.processed_data = []
+    if 'processing_complete' not in st.session_state:
+        st.session_state.processing_complete = False
+    
     # Header
     st.markdown("""
     <div class="main-header">
@@ -254,17 +402,24 @@ def main():
     
     analyzer = get_analyzer()
     
-    # Sidebar
-    st.sidebar.title("🎯 Configuration")
-    
-    # Model selection
-    st.sidebar.subheader("Supported AI Models")
-    for model, config in analyzer.supported_models.items():
-        st.sidebar.markdown(f"<span class='model-badge' style='background-color: {config['color']}20; color: {config['color']}'>{model}</span>", unsafe_allow_html=True)
-    
-    st.sidebar.subheader("📊 Comparison Pairs")
-    for pair in analyzer.comparison_pairs:
-        st.sidebar.write(f"• {pair[0]} vs {pair[1]}")
+    # System status
+    with st.sidebar:
+        st.title("🎯 Configuration")
+        
+        # System capabilities
+        st.subheader("🔧 System Status")
+        st.write(f"PDF Processing: {'✅' if PDF_AVAILABLE else '❌'}")
+        st.write(f"OCR Support: {'✅' if OCR_AVAILABLE else '❌'}")
+        st.write(f"Anthropic API: {'✅' if ANTHROPIC_AVAILABLE else '❌'}")
+        
+        # Model selection
+        st.subheader("Supported AI Models")
+        for model, config in analyzer.supported_models.items():
+            st.markdown(f"<span class='model-badge' style='background-color: {config['color']}20; color: {config['color']}'>{model}</span>", unsafe_allow_html=True)
+        
+        st.subheader("📊 Comparison Pairs")
+        for pair in analyzer.comparison_pairs:
+            st.write(f"• {pair[0]} vs {pair[1]}")
     
     # Main content
     tab1, tab2, tab3, tab4 = st.tabs(["📁 Upload & Process", "📊 Analysis Dashboard", "🔍 Detailed View", "📥 Export Data"])
@@ -279,6 +434,7 @@ def main():
         with col2:
             if st.button("📋 Load Sample Data", type="secondary"):
                 st.session_state.sample_data = True
+                st.session_state.processing_complete = False
         
         # File upload
         uploaded_files = st.file_uploader(
@@ -288,197 +444,101 @@ def main():
             help="Upload PDF files containing AI conversation screenshots"
         )
         
+        # Display file information
+        if uploaded_files:
+            st.subheader("📋 Uploaded Files")
+            for file in uploaded_files:
+                display_file_info(file)
+        
+        # Process button
         if uploaded_files or st.session_state.get('sample_data', False):
             if st.button("🚀 Process Documents", type="primary"):
+                st.session_state.processing_complete = False
                 process_documents(uploaded_files, analyzer)
     
     with tab2:
-        if 'processed_data' in st.session_state:
+        if st.session_state.get('processing_complete', False) and st.session_state.processed_data:
             show_analysis_dashboard(st.session_state.processed_data, analyzer)
         else:
             st.info("Please upload and process documents first.")
     
     with tab3:
-        if 'processed_data' in st.session_state:
+        if st.session_state.get('processing_complete', False) and st.session_state.processed_data:
             show_detailed_view(st.session_state.processed_data, analyzer)
         else:
             st.info("Please upload and process documents first.")
     
     with tab4:
-        if 'processed_data' in st.session_state:
+        if st.session_state.get('processing_complete', False) and st.session_state.processed_data:
             show_export_options(st.session_state.processed_data, analyzer)
         else:
             st.info("Please upload and process documents first.")
 
 def process_documents(uploaded_files, analyzer):
     """Process uploaded documents or load sample data"""
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    progress_container = st.container()
     
-    if st.session_state.get('sample_data', False):
-        # Load sample data
-        status_text.markdown('<div class="processing-status info">Loading sample data...</div>', unsafe_allow_html=True)
-        sample_data = get_sample_data()
-        st.session_state.processed_data = sample_data
-        st.session_state.sample_data = False
-        progress_bar.progress(100)
-        status_text.markdown('<div class="processing-status success">✅ Sample data loaded successfully!</div>', unsafe_allow_html=True)
-        return
-    
-    if not uploaded_files:
-        st.error("Please upload files or load sample data.")
-        return
-    
-    processed_conversations = []
-    
-    for i, file in enumerate(uploaded_files):
-        progress = int((i / len(uploaded_files)) * 100)
-        progress_bar.progress(progress)
-        status_text.markdown(f'<div class="processing-status info">Processing {file.name}...</div>', unsafe_allow_html=True)
+    with progress_container:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
         try:
-            # Read file content
-            if file.type == 'text/plain':
-                text_content = str(file.read(), "utf-8")
+            if st.session_state.get('sample_data', False):
+                # Load sample data
+                status_text.markdown('<div class="processing-status info">Loading sample data...</div>', unsafe_allow_html=True)
+                progress_bar.progress(50)
+                
+                sample_data = get_sample_data()
+                st.session_state.processed_data = sample_data
+                st.session_state.sample_data = False
+                st.session_state.processing_complete = True
+                
+                progress_bar.progress(100)
+                status_text.markdown('<div class="processing-status success">✅ Sample data loaded successfully!</div>', unsafe_allow_html=True)
+                
+                # Show summary
+                st.success(f"Loaded {len(sample_data)} sample conversations")
+                return
+            
+            if not uploaded_files:
+                st.error("Please upload files or load sample data.")
+                return
+            
+            processed_conversations = []
+            
+            for i, file in enumerate(uploaded_files):
+                file_progress = int((i / len(uploaded_files)) * 100)
+                
+                try:
+                    def progress_callback(progress, message):
+                        overall_progress = int(file_progress + (progress / len(uploaded_files)))
+                        progress_bar.progress(min(overall_progress, 99))
+                        status_text.markdown(f'<div class="processing-status info">{message}</div>', unsafe_allow_html=True)
+                    
+                    # Process the file
+                    conversations = analyzer.process_file_content(file, progress_callback)
+                    processed_conversations.extend(conversations)
+                    
+                except Exception as e:
+                    st.error(f"Error processing {file.name}: {str(e)}")
+                    continue
+            
+            progress_bar.progress(100)
+            status_text.markdown('<div class="processing-status success">✅ Processing complete!</div>', unsafe_allow_html=True)
+            
+            # Store processed data
+            st.session_state.processed_data = processed_conversations
+            st.session_state.processing_complete = True
+            
+            # Show summary
+            if processed_conversations:
+                st.success(f"Processed {len(processed_conversations)} conversations from {len(uploaded_files)} files")
             else:
-                # For PDF files, simulate text extraction
-                text_content = simulate_pdf_extraction(file.name)
-            
-            # Process the text
-            conversations = analyzer.process_pdf_text(text_content)
-            processed_conversations.extend(conversations)
-            
+                st.warning("No conversations were extracted from the uploaded files. Please check the file format and content.")
+                
         except Exception as e:
-            st.error(f"Error processing {file.name}: {str(e)}")
-    
-    progress_bar.progress(100)
-    status_text.markdown('<div class="processing-status success">✅ Processing complete!</div>', unsafe_allow_html=True)
-    
-    # Store processed data
-    st.session_state.processed_data = processed_conversations
-    
-    # Show summary
-    st.success(f"Processed {len(processed_conversations)} conversations from {len(uploaded_files)} files")
-
-def simulate_pdf_extraction(filename):
-    """Simulate PDF text extraction with realistic AI conversation data"""
-    sample_conversations = [
-        """
-        Page 1 - Bard 2.5 Pro vs AIS 2.5 Pro Comparison
-
-        User: What is 124.55 rounded to the nearest tenth?
-
-        Bard 2.5 Pro: 124.6
-
-        User: Can you show me the steps?
-
-        Bard 2.5 Pro: Of course! Here are the steps to round 124.55 to the nearest tenth:
-
-        1. Identify the tenths place: In 124.55, the tenths place is 5
-        2. Look at the hundredths place: The next digit is 5
-        3. Apply rounding rule: Since 5 ≥ 5, we round up
-        4. Result: 124.6
-
-        AIS 2.5 Pro: 124.6
-
-        The answer is 124.6. To round to the nearest tenth, I look at the hundredths digit (5). Since it's 5 or greater, I round the tenths digit up from 5 to 6.
-        """,
-        """
-        Page 2 - AIS 2.5 Pro vs cGPT o3 Comparison
-
-        User: Explain quantum computing in simple terms
-
-        AIS 2.5 Pro: Quantum computing is a revolutionary approach to computation that harnesses the principles of quantum mechanics. Unlike classical computers that use bits (0 or 1), quantum computers use quantum bits or "qubits" that can exist in multiple states simultaneously through a phenomenon called superposition.
-
-        Key concepts:
-        - Superposition: Qubits can be in multiple states at once
-        - Entanglement: Qubits can be correlated in ways that classical physics doesn't allow
-        - Quantum interference: Allows quantum algorithms to amplify correct answers
-
-        cGPT o3: Think of quantum computing like this: regular computers are like a coin that's either heads or tails. Quantum computers are like a spinning coin that's both heads AND tails at the same time until it lands.
-
-        This "spinning coin" state lets quantum computers try many solutions simultaneously, making them potentially much faster for certain problems like breaking codes or simulating molecules.
-        """,
-        """
-        Page 3 - AIS 2.5 Flash vs cGPT 4o Comparison
-
-        User: Write a Python function to calculate factorial
-
-        AIS 2.5 Flash: Here's a Python function to calculate factorial:
-
-        ```python
-        def factorial(n):
-            if n < 0:
-                raise ValueError("Factorial is not defined for negative numbers")
-            if n == 0 or n == 1:
-                return 1
-            return n * factorial(n - 1)
-        ```
-
-        cGPT 4o: Here are two approaches:
-
-        ```python
-        # Recursive approach
-        def factorial_recursive(n):
-            if n <= 1:
-                return 1
-            return n * factorial_recursive(n - 1)
-
-        # Iterative approach
-        def factorial_iterative(n):
-            result = 1
-            for i in range(1, n + 1):
-                result *= i
-            return result
-        ```
-
-        The iterative version is more efficient for large numbers.
-        """,
-        """
-        Page 4 - Bard 2.5 Pro vs cGPT o3 Complex Reasoning
-
-        User: If a train leaves Station A at 2:00 PM traveling at 60 mph, and another train leaves Station B at 2:30 PM traveling at 80 mph toward Station A, and the stations are 280 miles apart, when will they meet?
-
-        Bard 2.5 Pro: I need to solve this step-by-step:
-
-        Given information:
-        - Train A: leaves at 2:00 PM, speed = 60 mph
-        - Train B: leaves at 2:30 PM, speed = 80 mph
-        - Distance between stations = 280 miles
-
-        Let t = time (in hours) after 2:00 PM when trains meet
-
-        Train A travels for t hours: distance = 60t
-        Train B travels for (t - 0.5) hours: distance = 80(t - 0.5)
-
-        When they meet: 60t + 80(t - 0.5) = 280
-        60t + 80t - 40 = 280
-        140t = 320
-        t = 32/14 = 16/7 ≈ 2.286 hours
-
-        They meet at 2:00 PM + 2.286 hours = 4:17 PM
-
-        cGPT o3: Let me work through this systematically:
-
-        Setup:
-        - Train A starts at 2:00 PM at 60 mph
-        - Train B starts at 2:30 PM at 80 mph
-        - Total distance: 280 miles
-
-        At time t hours after 2:00 PM:
-        - Train A position: 60t miles from Station A
-        - Train B position: 80(t - 0.5) miles from Station B (only if t ≥ 0.5)
-
-        Meeting condition: 60t + 80(t - 0.5) = 280
-        60t + 80t - 40 = 280
-        140t = 320
-        t = 32/14 = 16/7 hours ≈ 2 hours 17 minutes
-
-        Meeting time: 2:00 PM + 2:17 = 4:17 PM
-        """
-    ]
-    
-    return "\n--- PAGE BREAK ---\n".join(sample_conversations)
+            st.error(f"Critical error during processing: {str(e)}")
+            st.error("Please try again or contact support.")
 
 def get_sample_data():
     """Return sample processed data"""
@@ -591,238 +651,268 @@ def show_analysis_dashboard(data, analyzer):
     """Show analysis dashboard with charts and metrics"""
     st.header("📊 Analysis Dashboard")
     
-    # Convert to DataFrame
-    df = pd.DataFrame(data)
+    if not data:
+        st.warning("No data available for analysis.")
+        return
     
-    # Key metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Conversations", len(df))
-    
-    with col2:
-        st.metric("AI Models", df['ai_model'].nunique())
-    
-    with col3:
-        st.metric("Pages Processed", df['page'].nunique())
-    
-    with col4:
-        avg_response_length = df['metadata'].apply(lambda x: x.get('response_length', 0)).mean()
-        st.metric("Avg Response Length", f"{avg_response_length:.0f} chars")
-    
-    # Model distribution
-    st.subheader("🤖 Model Distribution")
-    model_counts = df['ai_model'].value_counts()
-    
-    fig_pie = px.pie(
-        values=model_counts.values,
-        names=model_counts.index,
-        title="Distribution of AI Models"
-    )
-    st.plotly_chart(fig_pie, use_container_width=True)
-    
-    # Response types
-    st.subheader("📝 Response Type Analysis")
-    response_types = df['response_type'].value_counts()
-    
-    fig_bar = px.bar(
-        x=response_types.index,
-        y=response_types.values,
-        title="Response Types Distribution"
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
-    
-    # Model comparison
-    st.subheader("⚡ Model Performance Comparison")
-    
-    # Calculate metrics by model
-    model_metrics = df.groupby('ai_model').agg({
-        'metadata': lambda x: sum(item.get('response_length', 0) for item in x) / len(x),
-        'response_type': lambda x: (x == 'code').sum(),
-        'conversation_id': 'count'
-    }).round(2)
-    
-    model_metrics.columns = ['Avg Response Length', 'Code Responses', 'Total Responses']
-    
-    st.dataframe(model_metrics, use_container_width=True)
-    
-    # Comparison pairs analysis
-    st.subheader("🔄 Comparison Pairs Analysis")
-    
-    for pair in analyzer.comparison_pairs:
-        model1, model2 = pair
-        pair_data = df[df['ai_model'].isin([model1, model2])]
+    try:
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
         
-        if len(pair_data) > 0:
-            with st.expander(f"{model1} vs {model2}"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    model1_data = pair_data[pair_data['ai_model'] == model1]
-                    if len(model1_data) > 0:
-                        st.write(f"**{model1}**")
-                        st.write(f"Responses: {len(model1_data)}")
-                        avg_len = model1_data['metadata'].apply(lambda x: x.get('response_length', 0)).mean()
-                        st.write(f"Avg Length: {avg_len:.0f} chars")
-                
-                with col2:
-                    model2_data = pair_data[pair_data['ai_model'] == model2]
-                    if len(model2_data) > 0:
-                        st.write(f"**{model2}**")
-                        st.write(f"Responses: {len(model2_data)}")
-                        avg_len = model2_data['metadata'].apply(lambda x: x.get('response_length', 0)).mean()
-                        st.write(f"Avg Length: {avg_len:.0f} chars")
+        # Key metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Conversations", len(df))
+        
+        with col2:
+            st.metric("AI Models", df['ai_model'].nunique())
+        
+        with col3:
+            st.metric("Pages Processed", df['page'].nunique())
+        
+        with col4:
+            avg_response_length = df['metadata'].apply(lambda x: x.get('response_length', 0) if isinstance(x, dict) else 0).mean()
+            st.metric("Avg Response Length", f"{avg_response_length:.0f} chars")
+        
+        # Model distribution
+        st.subheader("🤖 Model Distribution")
+        model_counts = df['ai_model'].value_counts()
+        
+        if not model_counts.empty:
+            fig_pie = px.pie(
+                values=model_counts.values,
+                names=model_counts.index,
+                title="Distribution of AI Models"
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        
+        # Response types
+        st.subheader("📝 Response Type Analysis")
+        response_types = df['response_type'].value_counts()
+        
+        if not response_types.empty:
+            fig_bar = px.bar(
+                x=response_types.index,
+                y=response_types.values,
+                title="Response Types Distribution"
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+        
+        # Model comparison
+        st.subheader("⚡ Model Performance Comparison")
+        
+        # Calculate metrics by model
+        model_metrics = df.groupby('ai_model').agg({
+            'metadata': lambda x: sum(item.get('response_length', 0) if isinstance(item, dict) else 0 for item in x) / len(x),
+            'response_type': lambda x: (x == 'code').sum(),
+            'conversation_id': 'count'
+        }).round(2)
+        
+        model_metrics.columns = ['Avg Response Length', 'Code Responses', 'Total Responses']
+        
+        st.dataframe(model_metrics, use_container_width=True)
+        
+        # Comparison pairs analysis
+        st.subheader("🔄 Comparison Pairs Analysis")
+        
+        for pair in analyzer.comparison_pairs:
+            model1, model2 = pair
+            pair_data = df[df['ai_model'].isin([model1, model2])]
+            
+            if len(pair_data) > 0:
+                with st.expander(f"{model1} vs {model2}"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        model1_data = pair_data[pair_data['ai_model'] == model1]
+                        if len(model1_data) > 0:
+                            st.write(f"**{model1}**")
+                            st.write(f"Responses: {len(model1_data)}")
+                            avg_len = model1_data['metadata'].apply(lambda x: x.get('response_length', 0) if isinstance(x, dict) else 0).mean()
+                            st.write(f"Avg Length: {avg_len:.0f} chars")
+                    
+                    with col2:
+                        model2_data = pair_data[pair_data['ai_model'] == model2]
+                        if len(model2_data) > 0:
+                            st.write(f"**{model2}**")
+                            st.write(f"Responses: {len(model2_data)}")
+                            avg_len = model2_data['metadata'].apply(lambda x: x.get('response_length', 0) if isinstance(x, dict) else 0).mean()
+                            st.write(f"Avg Length: {avg_len:.0f} chars")
+    
+    except Exception as e:
+        st.error(f"Error displaying dashboard: {str(e)}")
+        st.error("Please check your data format and try again.")
 
 def show_detailed_view(data, analyzer):
     """Show detailed view of conversations"""
     st.header("🔍 Detailed Conversation View")
     
-    df = pd.DataFrame(data)
+    if not data:
+        st.warning("No data available for detailed view.")
+        return
     
-    # Filters
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        model_filter = st.selectbox(
-            "Filter by AI Model",
-            options=['All'] + sorted(df['ai_model'].unique().tolist())
-        )
-    
-    with col2:
-        type_filter = st.selectbox(
-            "Filter by Response Type",
-            options=['All'] + sorted(df['response_type'].unique().tolist())
-        )
-    
-    with col3:
-        page_filter = st.selectbox(
-            "Filter by Page",
-            options=['All'] + sorted(df['page'].unique().tolist())
-        )
-    
-    # Apply filters
-    filtered_df = df.copy()
-    
-    if model_filter != 'All':
-        filtered_df = filtered_df[filtered_df['ai_model'] == model_filter]
-    
-    if type_filter != 'All':
-        filtered_df = filtered_df[filtered_df['response_type'] == type_filter]
-    
-    if page_filter != 'All':
-        filtered_df = filtered_df[filtered_df['page'] == page_filter]
-    
-    # Search
-    search_term = st.text_input("🔍 Search conversations...")
-    if search_term:
-        mask = (
-            filtered_df['user_prompt'].str.contains(search_term, case=False, na=False) |
-            filtered_df['ai_response'].str.contains(search_term, case=False, na=False)
-        )
-        filtered_df = filtered_df[mask]
-    
-    # Display conversations
-    st.write(f"Showing {len(filtered_df)} conversations")
-    
-    for idx, row in filtered_df.iterrows():
-        with st.expander(f"Page {row['page']} - {row['ai_model']} - {row['response_type']}"):
-            col1, col2 = st.columns([1, 2])
-            
-            with col1:
-                st.write("**Metadata:**")
-                st.write(f"Model: {row['ai_model']}")
-                st.write(f"Version: {row['metadata'].get('model_version', 'N/A')}")
-                st.write(f"Response Length: {row['metadata'].get('response_length', 0)} chars")
-                st.write(f"Has Code: {row['metadata'].get('has_code', False)}")
-                st.write(f"Has Math: {row['metadata'].get('has_math', False)}")
-            
-            with col2:
-                st.write("**User Prompt:**")
-                st.write(row['user_prompt'])
+    try:
+        df = pd.DataFrame(data)
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            model_filter = st.selectbox(
+                "Filter by AI Model",
+                options=['All'] + sorted(df['ai_model'].unique().tolist())
+            )
+        
+        with col2:
+            type_filter = st.selectbox(
+                "Filter by Response Type",
+                options=['All'] + sorted(df['response_type'].unique().tolist())
+            )
+        
+        with col3:
+            page_filter = st.selectbox(
+                "Filter by Page",
+                options=['All'] + sorted(df['page'].unique().tolist())
+            )
+        
+        # Apply filters
+        filtered_df = df.copy()
+        
+        if model_filter != 'All':
+            filtered_df = filtered_df[filtered_df['ai_model'] == model_filter]
+        
+        if type_filter != 'All':
+            filtered_df = filtered_df[filtered_df['response_type'] == type_filter]
+        
+        if page_filter != 'All':
+            filtered_df = filtered_df[filtered_df['page'] == page_filter]
+        
+        # Search
+        search_term = st.text_input("🔍 Search conversations...")
+        if search_term:
+            mask = (
+                filtered_df['user_prompt'].str.contains(search_term, case=False, na=False) |
+                filtered_df['ai_response'].str.contains(search_term, case=False, na=False)
+            )
+            filtered_df = filtered_df[mask]
+        
+        # Display conversations
+        st.write(f"Showing {len(filtered_df)} conversations")
+        
+        for idx, row in filtered_df.iterrows():
+            with st.expander(f"Page {row['page']} - {row['ai_model']} - {row['response_type']}"):
+                col1, col2 = st.columns([1, 2])
                 
-                st.write("**AI Response:**")
-                st.write(row['ai_response'])
+                with col1:
+                    st.write("**Metadata:**")
+                    st.write(f"Model: {row['ai_model']}")
+                    metadata = row['metadata'] if isinstance(row['metadata'], dict) else {}
+                    st.write(f"Version: {metadata.get('model_version', 'N/A')}")
+                    st.write(f"Response Length: {metadata.get('response_length', 0)} chars")
+                    st.write(f"Has Code: {metadata.get('has_code', False)}")
+                    st.write(f"Has Math: {metadata.get('has_math', False)}")
                 
-                if row['conversation_context']:
-                    st.write("**Context:**")
-                    st.write(row['conversation_context'])
+                with col2:
+                    st.write("**User Prompt:**")
+                    st.write(row['user_prompt'])
+                    
+                    st.write("**AI Response:**")
+                    st.write(row['ai_response'])
+                    
+                    if row['conversation_context']:
+                        st.write("**Context:**")
+                        st.write(row['conversation_context'])
+    
+    except Exception as e:
+        st.error(f"Error displaying detailed view: {str(e)}")
 
 def show_export_options(data, analyzer):
     """Show export options"""
     st.header("📥 Export Data")
     
-    df = pd.DataFrame(data)
+    if not data:
+        st.warning("No data available for export.")
+        return
     
-    # Export formats
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Export Formats")
+    try:
+        df = pd.DataFrame(data)
         
-        # JSON export
-        if st.button("📄 Export as JSON"):
-            json_str = json.dumps(data, indent=2)
-            st.download_button(
-                label="Download JSON",
-                data=json_str,
-                file_name=f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
+        # Export formats
+        col1, col2 = st.columns(2)
         
-        # CSV export
-        if st.button("📊 Export as CSV"):
-            # Flatten the data for CSV
-            flat_data = []
-            for item in data:
-                flat_item = {
-                    'conversation_id': item['conversation_id'],
-                    'page': item['page'],
-                    'ai_model': item['ai_model'],
-                    'user_prompt': item['user_prompt'],
-                    'ai_response': item['ai_response'],
-                    'response_type': item['response_type'],
-                    'conversation_context': item['conversation_context'],
-                    'timestamp': item['timestamp'],
-                    'model_version': item['metadata'].get('model_version', ''),
-                    'response_length': item['metadata'].get('response_length', 0),
-                    'has_code': item['metadata'].get('has_code', False),
-                    'has_math': item['metadata'].get('has_math', False)
-                }
-                flat_data.append(flat_item)
+        with col1:
+            st.subheader("📊 Export Formats")
             
-            csv_df = pd.DataFrame(flat_data)
-            csv_str = csv_df.to_csv(index=False)
+            # JSON export
+            if st.button("📄 Export as JSON"):
+                json_str = json.dumps(data, indent=2)
+                st.download_button(
+                    label="Download JSON",
+                    data=json_str,
+                    file_name=f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
             
-            st.download_button(
-                label="Download CSV",
-                data=csv_str,
-                file_name=f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-    
-    with col2:
-        st.subheader("📋 Summary Report")
+            # CSV export
+            if st.button("📊 Export as CSV"):
+                # Flatten the data for CSV
+                flat_data = []
+                for item in data:
+                    metadata = item.get('metadata', {}) if isinstance(item.get('metadata'), dict) else {}
+                    flat_item = {
+                        'conversation_id': item.get('conversation_id', ''),
+                        'page': item.get('page', 0),
+                        'ai_model': item.get('ai_model', ''),
+                        'user_prompt': item.get('user_prompt', ''),
+                        'ai_response': item.get('ai_response', ''),
+                        'response_type': item.get('response_type', ''),
+                        'conversation_context': item.get('conversation_context', ''),
+                        'timestamp': item.get('timestamp', ''),
+                        'model_version': metadata.get('model_version', ''),
+                        'response_length': metadata.get('response_length', 0),
+                        'has_code': metadata.get('has_code', False),
+                        'has_math': metadata.get('has_math', False)
+                    }
+                    flat_data.append(flat_item)
+                
+                csv_df = pd.DataFrame(flat_data)
+                csv_str = csv_df.to_csv(index=False)
+                
+                st.download_button(
+                    label="Download CSV",
+                    data=csv_str,
+                    file_name=f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
         
-        # Generate summary report
-        if st.button("📋 Generate Summary Report"):
-            report = generate_summary_report(data, analyzer)
+        with col2:
+            st.subheader("📋 Summary Report")
             
-            st.download_button(
-                label="Download Report",
-                data=report,
-                file_name=f"ai_analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
-            )
+            # Generate summary report
+            if st.button("📋 Generate Summary Report"):
+                report = generate_summary_report(data, analyzer)
+                
+                st.download_button(
+                    label="Download Report",
+                    data=report,
+                    file_name=f"ai_analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain"
+                )
+        
+        # Preview data
+        st.subheader("👀 Data Preview")
+        st.dataframe(df.head(10), use_container_width=True)
     
-    # Preview data
-    st.subheader("👀 Data Preview")
-    st.dataframe(df.head(10), use_container_width=True)
+    except Exception as e:
+        st.error(f"Error in export options: {str(e)}")
 
 def generate_summary_report(data, analyzer):
     """Generate a summary report"""
-    df = pd.DataFrame(data)
-    
-    report = f"""
+    try:
+        df = pd.DataFrame(data)
+        
+        report = f"""
 AI Model Analysis Summary Report
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -831,7 +921,6 @@ OVERVIEW
 Total Conversations: {len(df)}
 Pages Processed: {df['page'].nunique()}
 AI Models Analyzed: {', '.join(df['ai_model'].unique())}
-Date Range: {df['timestamp'].min()} to {df['timestamp'].max()}
 
 MODEL DISTRIBUTION
 ==================
@@ -844,14 +933,14 @@ RESPONSE TYPE ANALYSIS
 MODEL PERFORMANCE METRICS
 =========================
 """
-    
-    for model in df['ai_model'].unique():
-        model_data = df[df['ai_model'] == model]
-        avg_length = model_data['metadata'].apply(lambda x: x.get('response_length', 0)).mean()
-        code_responses = model_data['metadata'].apply(lambda x: x.get('has_code', False)).sum()
-        math_responses = model_data['metadata'].apply(lambda x: x.get('has_math', False)).sum()
         
-        report += f"""
+        for model in df['ai_model'].unique():
+            model_data = df[df['ai_model'] == model]
+            avg_length = model_data['metadata'].apply(lambda x: x.get('response_length', 0) if isinstance(x, dict) else 0).mean()
+            code_responses = model_data['metadata'].apply(lambda x: x.get('has_code', False) if isinstance(x, dict) else False).sum()
+            math_responses = model_data['metadata'].apply(lambda x: x.get('has_math', False) if isinstance(x, dict) else False).sum()
+            
+            report += f"""
 {model}:
   - Total Responses: {len(model_data)}
   - Average Response Length: {avg_length:.0f} characters
@@ -859,30 +948,29 @@ MODEL PERFORMANCE METRICS
   - Math Responses: {math_responses}
   - Response Types: {model_data['response_type'].value_counts().to_dict()}
 """
-    
-    report += f"""
+        
+        report += f"""
 
 COMPARISON PAIRS ANALYSIS
 =========================
 """
-    
-    for pair in analyzer.comparison_pairs:
-        model1, model2 = pair
-        pair_data = df[df['ai_model'].isin([model1, model2])]
         
-        if len(pair_data) > 0:
-            report += f"""
+        for pair in analyzer.comparison_pairs:
+            model1, model2 = pair
+            pair_data = df[df['ai_model'].isin([model1, model2])]
+            
+            if len(pair_data) > 0:
+                report += f"""
 {model1} vs {model2}:
   - Total conversations: {len(pair_data)}
   - {model1} responses: {len(pair_data[pair_data['ai_model'] == model1])}
   - {model2} responses: {len(pair_data[pair_data['ai_model'] == model2])}
 """
+        
+        return report
     
-    return report
+    except Exception as e:
+        return f"Error generating report: {str(e)}"
 
 if __name__ == "__main__":
-    # Initialize session state
-    if 'processed_data' not in st.session_state:
-        st.session_state.processed_data = []
-    
     main()
